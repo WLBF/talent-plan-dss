@@ -18,11 +18,13 @@ futures-timer = "3.0"
 log = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
-rand = "0.7"
+rand = { version = "0.7", features = ["std"] }
+tokio = { version = "1.0.2", features = ["full"] }
+
 
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }
-linearizability = { path = "../linearizability"}
+linearizability = { path = "../linearizability" }
 
 [dev-dependencies]
 env_logger = "0.7"
