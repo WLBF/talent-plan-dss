@@ -365,27 +365,18 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
         let rf = self.raft.lock().unwrap();
         rf.start(command)
     }
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
         let rf = self.raft.lock().unwrap();
         rf.current_term
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
         let rf = self.raft.lock().unwrap();
         rf.role == Role::Leader
     }
@@ -473,7 +464,6 @@ async fn try_election(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
             None => true,
             Some(None) => false,
             Some(Some(res)) => {
-
                 // critical section
                 if let Ok(reply) = res {
                     let mut rf = raft.lock().unwrap();
@@ -524,22 +514,16 @@ async fn heartbeat_loop(raft: Arc<Mutex<Raft>>, mut heartbeat_rx: Receiver<i32>)
     loop {
         heartbeat_rx.recv().await;
         loop {
-            let mut pause = false;
-
-            // critical section
             {
                 let rf = raft.lock().unwrap();
                 if rf.role != Role::Leader {
-                    pause = true;
+                    break;
                 }
 
                 let raft_1 = raft.clone();
                 tokio::spawn(heartbeat(raft_1));
-            };
-
-            if pause {
-                break;
             }
+
             tokio::time::sleep(time::Duration::from_millis(100)).await;
         }
     }
@@ -571,7 +555,6 @@ async fn heartbeat(raft: Arc<Mutex<Raft>>) {
             None => true,
             Some(None) => false,
             Some(Some(res)) => {
-
                 // critical section
                 if let Ok(reply) = res {
                     let mut rf = raft.lock().unwrap();
