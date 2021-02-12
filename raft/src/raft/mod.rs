@@ -1,7 +1,8 @@
 use futures::channel::mpsc::UnboundedSender;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use std::collections::VecDeque;
+use std::cmp::{max, min};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time;
 use std::time::Instant;
@@ -18,7 +19,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use futures::FutureExt;
+use futures::SinkExt;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -67,8 +68,13 @@ pub struct Raft {
     current_term: u64,
     vote_for: Option<usize>,
     role: Role,
-    last_heartbeat: Instant,
+    last_receive: Instant,
     apply_ch: UnboundedSender<ApplyMsg>,
+    commit_index: u64,
+    last_applied: u64,
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
+    log: Vec<LogEntry>,
 }
 
 impl Raft {
@@ -87,6 +93,7 @@ impl Raft {
         apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
+        let len = peers.len();
 
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
@@ -97,8 +104,13 @@ impl Raft {
             vote_for: None,
             current_term: 0,
             role: Role::Follower,
-            last_heartbeat: Instant::now(),
+            last_receive: Instant::now(),
             apply_ch,
+            commit_index: 0,
+            last_applied: 0,
+            next_index: vec![1; len],
+            match_index: vec![0; len],
+            log: vec![],
         };
 
         // initialize from state persisted before a crash
@@ -181,6 +193,27 @@ impl Raft {
         rx
     }
 
+    fn make_append_entries(&self, peer: usize) -> AppendEntriesArgs {
+        let mut args = AppendEntriesArgs {
+            term: self.current_term,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: self.commit_index,
+        };
+
+        let next_index = self.next_index[peer];
+        for idx in next_index..=self.last_log_index() {
+            args.entries.push(self.get_entry(idx).unwrap());
+        }
+
+        if let Some(prev_log) = self.get_entry(max(next_index, 1) - 1) {
+            args.prev_log_index = prev_log.index;
+            args.prev_log_term = prev_log.term;
+        }
+        args
+    }
+
     fn send_append_entries(
         &self,
         server: usize,
@@ -196,21 +229,40 @@ impl Raft {
         rx
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
+        if self.role == Role::Leader {
+            let mut buf = vec![];
+            labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+            // Your code here (2B).
+            let index = self.last_log_index() + 1;
+            let term = self.current_term;
 
-        if is_leader {
+            let entry = LogEntry {
+                index,
+                term,
+                command: buf,
+            };
+
+            info!("[{}] start {:?}", self.me, entry);
+            self.log.push(entry);
+            self.match_index[self.me] = index;
             Ok((index, term))
         } else {
             Err(Error::NotLeader)
+        }
+    }
+
+    fn is_candidate_up_to_date(&self, index: u64, term: u64) -> bool {
+        let last_term = self.last_log_term();
+        let last_index = self.last_log_index();
+
+        if term == last_term {
+            index >= last_index
+        } else {
+            term > last_term
         }
     }
 
@@ -220,48 +272,110 @@ impl Raft {
             self.convert_to_follower(args.term);
         }
 
-        let mut vote_granted = true;
+        let mut reply = RequestVoteReply {
+            term: self.current_term,
+            vote_granted: false,
+        };
+
         if args.term < self.current_term {
-            vote_granted = false;
+            return Ok(reply);
         }
 
         if self.vote_for.is_some() {
-            vote_granted = false;
+            return Ok(reply);
         }
 
-        if vote_granted {
+        if self.is_candidate_up_to_date(args.last_log_index, args.last_log_term) {
+            reply.vote_granted = true;
             self.vote_for.replace(args.candidate_id as usize);
+            self.last_receive = Instant::now();
         }
 
-        Ok(RequestVoteReply {
-            term: self.current_term,
-            vote_granted,
-        })
+        Ok(reply)
     }
 
     // append entries rpc handler
     fn append_entries(&mut self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
+        let mut reply = AppendEntriesReply {
+            term: self.current_term,
+            success: false,
+            conflict_index: 0,
+            conflict_term: 0,
+        };
+
         if args.term < self.current_term {
-            return Ok(AppendEntriesReply {
-                term: self.current_term,
-                success: false,
-            });
+            return Ok(reply);
         }
+
+        self.last_receive = Instant::now();
 
         if args.term > self.current_term {
             self.convert_to_follower(args.term);
         }
 
-        self.last_heartbeat = Instant::now();
-
         if self.role == Role::Candidate {
             self.convert_to_follower(args.term);
         }
 
-        Ok(AppendEntriesReply {
-            term: self.current_term,
-            success: true,
-        })
+        if args.prev_log_index > 0 {
+            let opt = self.get_entry(args.prev_log_index);
+            if opt.is_none() {
+                reply.conflict_index = self.last_log_index();
+                return Ok(reply);
+            }
+
+            let prev_log = opt.unwrap();
+            if prev_log.term != args.prev_log_term {
+                self.truncate_log(prev_log.index);
+                reply.conflict_term = prev_log.term;
+                reply.conflict_index = self
+                    .log
+                    .iter()
+                    .find(|&x| x.term == prev_log.term)
+                    .map(|x| x.index)
+                    .unwrap();
+                return Ok(reply);
+            }
+        }
+
+        for log in args.entries.iter() {
+            if let Some(local) = self.get_entry(log.index) {
+                if local.term != log.term {
+                    self.truncate_log(local.index);
+                    self.log.push(log.to_owned());
+                }
+            } else {
+                self.log.push(log.to_owned());
+            }
+        }
+
+        if args.leader_commit > self.commit_index {
+            self.commit_index = min(args.leader_commit, self.last_log_index());
+        }
+
+        reply.success = true;
+        Ok(reply)
+    }
+
+    fn check_committed(&self, index: u64) -> bool {
+        if index <= self.commit_index || self.role != Role::Leader {
+            return false;
+        }
+
+        let cnt = self
+            .match_index
+            .iter()
+            .fold(0, |acc, &x| acc + (x >= index) as usize);
+        if cnt <= self.peers.len() / 2 {
+            return false;
+        }
+
+        let log = self.get_entry(index).expect("check committed entry none");
+        log.term == self.current_term
+    }
+
+    fn check_apply(&self) -> bool {
+        self.commit_index > self.last_applied
     }
 
     fn convert_to_candidate(&mut self) {
@@ -286,10 +400,39 @@ impl Raft {
 
     fn convert_to_leader(&mut self) {
         self.role = Role::Leader;
+
+        for i in 0..self.next_index.len() {
+            self.next_index[i] = self.last_log_index() + 1;
+        }
+
         info!(
             "[{}] convert to leader, term: {}",
             self.me, self.current_term
         );
+    }
+
+    fn last_log_index(&self) -> u64 {
+        self.log.last().map(|l| l.index).unwrap_or(0)
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.log.last().map(|l| l.term).unwrap_or(0)
+    }
+
+    fn get_entry(&self, index: u64) -> Option<LogEntry> {
+        match index {
+            0 => None,
+            idx => self.log.get(idx as usize - 1).map(|x| x.to_owned()),
+        }
+    }
+
+    fn truncate_log(&mut self, index: u64) {
+        while let Some(entry) = self.log.last() {
+            if entry.index < index {
+                break;
+            }
+            self.log.pop();
+        }
     }
 }
 
@@ -327,25 +470,38 @@ pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>,
     rt: Arc<runtime::Runtime>,
+    stop: Arc<AtomicBool>,
+    apply_tx: Sender<i32>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        let (tx, rx) = channel(1);
+        let (heartbeat_tx, heartbeat_rx) = channel(1);
+        let (apply_tx, apply_rx) = channel(1);
         let raft = Arc::new(Mutex::new(raft));
 
         let raft_1 = raft.clone();
         let raft_2 = raft.clone();
+        let raft_3 = raft.clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_1 = stop.clone();
+        let stop_2 = stop.clone();
+        let stop_3 = stop.clone();
 
         let rt = runtime::Runtime::new().unwrap();
-        rt.spawn(election_loop(raft_1, tx));
-        rt.spawn(heartbeat_loop(raft_2, rx));
+        rt.spawn(election_loop(stop_1, raft_1, heartbeat_tx));
+        let apply_tx_1 = apply_tx.clone();
+        rt.spawn(heartbeat_loop(stop_2, raft_2, heartbeat_rx, apply_tx_1));
+        rt.spawn(apply_loop(stop_3, raft_3, apply_rx));
 
         Node {
             raft,
             rt: Arc::new(rt),
+            stop,
+            apply_tx,
         }
     }
 
@@ -365,7 +521,7 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        let rf = self.raft.lock().unwrap();
+        let mut rf = self.raft.lock().unwrap();
         rf.start(command)
     }
 
@@ -400,13 +556,14 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-async fn election_loop(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
+async fn election_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
     let mut rng = StdRng::from_entropy();
-    let mut last_election = Instant::now();
-    loop {
+
+    while !stop.load(Ordering::Relaxed) {
         let num = rng.gen_range(250, 400);
         let timeout = time::Duration::from_millis(num);
 
@@ -415,14 +572,11 @@ async fn election_loop(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
 
         // critical section
         {
-            let rf = raft.lock().unwrap();
+            let mut rf = raft.lock().unwrap();
             let now = Instant::now();
-            if rf.role != Role::Leader
-                && now.duration_since(rf.last_heartbeat) > timeout
-                && now.duration_since(last_election) > timeout
-            {
+            if rf.role != Role::Leader && now.duration_since(rf.last_receive) > timeout {
+                rf.last_receive = now;
                 tokio::spawn(try_election(raft_1, heartbeat_tx_1));
-                last_election = now;
             }
         }
 
@@ -431,12 +585,9 @@ async fn election_loop(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
 }
 
 async fn try_election(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
-    let mut rxs = VecDeque::new();
+    let mut rxs = Vec::new();
     let peer_num;
-    let mut args = RequestVoteArgs {
-        term: 0,
-        candidate_id: 0,
-    };
+    let args_term;
 
     // critical section
     {
@@ -444,74 +595,67 @@ async fn try_election(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
         rf.convert_to_candidate();
 
         peer_num = rf.peers.len();
-        args.term = rf.current_term;
-        args.candidate_id = rf.me as u32;
+        args_term = rf.current_term;
+
+        let args = RequestVoteArgs {
+            term: rf.current_term,
+            candidate_id: rf.me as u32,
+            last_log_index: rf.last_log_index(),
+            last_log_term: rf.last_log_term(),
+        };
 
         for i in 0..peer_num {
             if i != rf.me {
                 info!("[{}] -> [{}] {:?}", rf.me, i, args);
                 let rx = rf.send_request_vote(i, args.clone());
-                rxs.push_back((i, rx));
+                rxs.push((i, rx));
             }
         }
     }
 
-    let mut cnt = 0;
-    let mut done = 0;
+    let cnt = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
 
-    while let Some((i, mut rx)) = rxs.pop_front() {
-        let empty = match rx.recv().now_or_never() {
-            None => true,
-            Some(None) => false,
-            Some(Some(res)) => {
-                // critical section
-                if let Ok(reply) = res {
-                    let mut rf = raft.lock().unwrap();
-                    info!("[{}] <- [{}] {:?}", rf.me, i, reply);
-                    if reply.term > rf.current_term {
-                        rf.convert_to_follower(reply.term);
-                    }
-
-                    if reply.term == args.term && reply.vote_granted {
-                        cnt += 1;
-                    }
+    for (i, mut rx) in rxs {
+        let raft_1 = raft.clone();
+        let cnt_1 = cnt.clone();
+        let done_1 = done.clone();
+        tokio::spawn(async move {
+            if let Some(Ok(reply)) = rx.recv().await {
+                let mut rf = raft_1.lock().unwrap();
+                info!("[{}] <- [{}] {:?}", rf.me, i, reply);
+                if reply.term > rf.current_term {
+                    rf.convert_to_follower(reply.term);
                 }
-                false
+
+                if reply.term == args_term && reply.vote_granted {
+                    cnt_1.fetch_add(1, Ordering::SeqCst);
+                }
             }
-        };
+            done_1.fetch_add(1, Ordering::SeqCst);
+        });
+    }
 
-        if empty {
-            rxs.push_back((i, rx));
-        } else {
-            done += 1;
-        }
-
-        if cnt >= peer_num / 2 {
-            let valid;
-
-            // critical section
-            {
-                let mut rf = raft.lock().unwrap();
-                valid = args.term == rf.current_term && rf.role == Role::Candidate;
-                if valid {
-                    rf.convert_to_leader();
-                }
-            };
-
-            if valid {
-                heartbeat_tx.send(1).await.unwrap();
+    while done.load(Ordering::SeqCst) < peer_num {
+        if cnt.load(Ordering::SeqCst) >= peer_num / 2 {
+            let mut rf = raft.lock().unwrap();
+            if args_term == rf.current_term && rf.role == Role::Candidate {
+                rf.convert_to_leader();
+                tokio::spawn(async move { heartbeat_tx.send(1).await });
             }
             return;
         }
-
-        if peer_num - done + cnt < peer_num / 2 {
-            return;
-        }
+        tokio::time::sleep(time::Duration::from_millis(10)).await;
     }
 }
 
-async fn heartbeat_loop(raft: Arc<Mutex<Raft>>, mut heartbeat_rx: Receiver<i32>) {
-    loop {
+async fn heartbeat_loop(
+    stop: Arc<AtomicBool>,
+    raft: Arc<Mutex<Raft>>,
+    mut heartbeat_rx: Receiver<i32>,
+    apply_tx: Sender<i32>,
+) {
+    while !stop.load(Ordering::Relaxed) {
         heartbeat_rx.recv().await;
         loop {
             {
@@ -521,7 +665,8 @@ async fn heartbeat_loop(raft: Arc<Mutex<Raft>>, mut heartbeat_rx: Receiver<i32>)
                 }
 
                 let raft_1 = raft.clone();
-                tokio::spawn(heartbeat(raft_1));
+                let tx_1 = apply_tx.clone();
+                tokio::spawn(heartbeat(raft_1, tx_1));
             }
 
             tokio::time::sleep(time::Duration::from_millis(100)).await;
@@ -529,9 +674,8 @@ async fn heartbeat_loop(raft: Arc<Mutex<Raft>>, mut heartbeat_rx: Receiver<i32>)
     }
 }
 
-async fn heartbeat(raft: Arc<Mutex<Raft>>) {
-    let mut rxs = VecDeque::new();
-    let mut args = AppendEntriesArgs { term: 0 };
+async fn heartbeat(raft: Arc<Mutex<Raft>>, apply_tx: Sender<i32>) {
+    let mut rxs = Vec::new();
 
     // critical section
     {
@@ -539,37 +683,91 @@ async fn heartbeat(raft: Arc<Mutex<Raft>>) {
         if rf.role != Role::Leader {
             return;
         }
-        args.term = rf.current_term;
 
         for i in 0..rf.peers.len() {
             if i != rf.me {
+                let args = rf.make_append_entries(i);
                 let rx = rf.send_append_entries(i, args.clone());
-                rxs.push_back((i, rx));
                 info!("[{}] -> [{}] {:?}", rf.me, i, args);
+                rxs.push((i, args, rx));
             }
         }
     }
 
-    while let Some((i, mut rx)) = rxs.pop_front() {
-        let empty = match rx.recv().now_or_never() {
-            None => true,
-            Some(None) => false,
-            Some(Some(res)) => {
-                // critical section
-                if let Ok(reply) = res {
-                    let mut rf = raft.lock().unwrap();
-                    info!("[{}] <- [{}] {:?}", rf.me, i, reply);
-                    if reply.term > rf.current_term {
-                        rf.convert_to_follower(reply.term);
-                        return;
+    for (i, args, mut rx) in rxs {
+        let raft_1 = raft.clone();
+        let tx_1 = apply_tx.clone();
+        tokio::spawn(async move {
+            if let Some(Ok(reply)) = rx.recv().await {
+                let mut rf = raft_1.lock().unwrap();
+                info!("[{}] <- [{}] {:?}", rf.me, i, reply);
+                if reply.term > rf.current_term {
+                    rf.convert_to_follower(reply.term);
+                    return;
+                }
+
+                if rf.role == Role::Leader && args.term == rf.current_term {
+                    if reply.success {
+                        if !args.entries.is_empty() {
+                            let last = args.prev_log_index + args.entries.len() as u64;
+                            rf.match_index[i] = max(rf.match_index[i], last);
+                            rf.next_index[i] = max(rf.next_index[i], last + 1);
+
+                            if rf.check_committed(rf.match_index[i]) {
+                                rf.commit_index = rf.match_index[i];
+                                info!("[{}] commit {}", rf.me, rf.commit_index);
+                                tokio::spawn(async move { tx_1.send(1).await });
+                            }
+                        }
+                    } else {
+                        let next_idx = match rf
+                            .log
+                            .iter()
+                            .rev()
+                            .find(|&x| x.term == reply.conflict_term)
+                            .map(|x| x.index)
+                        {
+                            Some(idx) => idx + 1,
+                            None => reply.conflict_index,
+                        };
+
+                        rf.next_index[i] = min(rf.next_index[i], next_idx);
                     }
                 }
-                false
             }
-        };
+        });
+    }
+}
 
-        if empty {
-            rxs.push_back((i, rx));
+async fn apply_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, mut apply_rx: Receiver<i32>) {
+    let mut apply_ch = {
+        let rf = raft.lock().unwrap();
+        rf.apply_ch.clone()
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        apply_rx.recv().await;
+        let mut logs = vec![];
+
+        {
+            let mut rf = raft.lock().unwrap();
+            for idx in rf.last_applied + 1..=rf.commit_index {
+                let log = rf.get_entry(idx).expect("apply entry missing");
+                logs.push(log);
+            }
+
+            info!("[{}] apply {:?}", rf.me, logs);
+            rf.last_applied = rf.commit_index;
+        }
+
+        for log in logs {
+            let msg = ApplyMsg {
+                command_valid: true,
+                command: log.command,
+                command_index: log.index,
+            };
+
+            apply_ch.send(msg).await.unwrap();
         }
     }
 }
@@ -593,10 +791,15 @@ impl RaftService for Node {
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let raft = self.raft.clone();
+        let tx = self.apply_tx.clone();
         self.rt
             .spawn(async move {
                 let mut rf = raft.lock().unwrap();
-                rf.append_entries(args)
+                let reply = rf.append_entries(args);
+                if rf.check_apply() {
+                    tokio::spawn(async move { tx.send(1).await });
+                }
+                reply
             })
             .await
             .unwrap()
