@@ -123,11 +123,15 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let mut data = vec![];
+        let state = PersistentState {
+            current_term: self.current_term,
+            vote_for: self.vote_for.map(|x| x as i32).unwrap_or(-1),
+            log: self.log.clone(),
+        };
+
+        labcodec::encode(&state, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -136,17 +140,19 @@ impl Raft {
             // bootstrap without any state?
             return;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+
+        match labcodec::decode::<PersistentState>(data) {
+            Ok(o) => {
+                self.current_term = o.current_term;
+                self.log = o.log;
+                if o.vote_for >= 0 {
+                    self.vote_for.replace(o.vote_for as usize);
+                }
+            }
+            Err(e) => {
+                panic!("{:?}", e);
+            }
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -249,6 +255,7 @@ impl Raft {
             info!("[{}] start {:?}", self.me, entry);
             self.log.push(entry);
             self.match_index[self.me] = index;
+            self.persist();
             Ok((index, term))
         } else {
             Err(Error::NotLeader)
@@ -291,6 +298,7 @@ impl Raft {
             self.last_receive = Instant::now();
         }
 
+        self.persist();
         Ok(reply)
     }
 
@@ -354,6 +362,8 @@ impl Raft {
         }
 
         reply.success = true;
+
+        self.persist();
         Ok(reply)
     }
 
@@ -382,6 +392,7 @@ impl Raft {
         self.role = Role::Candidate;
         self.current_term += 1;
         self.vote_for.replace(self.me);
+        self.persist();
         info!(
             "[{}] convert to candidate, term: {}",
             self.me, self.current_term
@@ -392,6 +403,7 @@ impl Raft {
         self.role = Role::Follower;
         self.current_term = term;
         self.vote_for.take();
+        self.persist();
         info!(
             "[{}] convert to follower, term: {}",
             self.me, self.current_term
