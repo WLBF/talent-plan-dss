@@ -1,11 +1,10 @@
 use futures::channel::mpsc::UnboundedSender;
+use futures::SinkExt;
 use rand::prelude::*;
-use rand::rngs::StdRng;
 use std::cmp::{max, min};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::runtime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -19,7 +18,6 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use futures::SinkExt;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -108,7 +106,7 @@ impl Raft {
             apply_ch,
             commit_index: 0,
             last_applied: 0,
-            next_index: vec![1; len],
+            next_index: vec![0; len],
             match_index: vec![0; len],
             log: vec![],
         };
@@ -213,7 +211,8 @@ impl Raft {
             args.entries.push(self.get_entry(idx).unwrap());
         }
 
-        if let Some(prev_log) = self.get_entry(max(next_index, 1) - 1) {
+        assert!(next_index > 0);
+        if let Some(prev_log) = self.get_entry(next_index - 1) {
             args.prev_log_index = prev_log.index;
             args.prev_log_term = prev_log.term;
         }
@@ -334,7 +333,6 @@ impl Raft {
 
             let prev_log = opt.unwrap();
             if prev_log.term != args.prev_log_term {
-                self.truncate_log(prev_log.index);
                 reply.conflict_term = prev_log.term;
                 reply.conflict_index = self
                     .log
@@ -342,6 +340,7 @@ impl Raft {
                     .find(|&x| x.term == prev_log.term)
                     .map(|x| x.index)
                     .unwrap();
+                self.truncate_log(prev_log.index);
                 return Ok(reply);
             }
         }
@@ -573,11 +572,9 @@ impl Node {
 }
 
 async fn election_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
-    let mut rng = StdRng::from_entropy();
-
     while !stop.load(Ordering::Relaxed) {
-        let num = rng.gen_range(250, 400);
-        let timeout = time::Duration::from_millis(num);
+        let num = thread_rng().gen_range(350, 500);
+        let timeout = Duration::from_millis(num);
 
         let raft_1 = raft.clone();
         let heartbeat_tx_1 = heartbeat_tx.clone();
@@ -592,7 +589,7 @@ async fn election_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, heartbeat_
             }
         }
 
-        tokio::time::sleep(time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -657,7 +654,7 @@ async fn try_election(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
             }
             return;
         }
-        tokio::time::sleep(time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -681,7 +678,7 @@ async fn heartbeat_loop(
                 tokio::spawn(heartbeat(raft_1, tx_1));
             }
 
-            tokio::time::sleep(time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }
@@ -744,6 +741,8 @@ async fn heartbeat(raft: Arc<Mutex<Raft>>, apply_tx: Sender<i32>) {
                         };
 
                         rf.next_index[i] = min(rf.next_index[i], next_idx);
+                        // make sure next_index[i] always larger than 0
+                        rf.next_index[i] = max(rf.next_index[i], 1);
                     }
                 }
             }
