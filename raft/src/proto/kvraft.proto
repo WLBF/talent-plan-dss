@@ -6,6 +6,15 @@ enum Op {
     Unknown = 0;
     Put = 1;
     Append = 2;
+    Get = 3;
+}
+
+message Command {
+    Op op = 1;
+    string key = 2;
+    string value = 3;
+    string name = 4;
+    uint64 seq = 5;
 }
 
 /// Put or Append
@@ -14,7 +23,8 @@ message PutAppendRequest {
     string value = 2;
     // "Put" or "Append"
     Op op = 3;
-    // You'll have to add definitions here.
+    string name = 4;
+    uint64 seq = 5;
 }
 
 message PutAppendReply {
@@ -24,7 +34,8 @@ message PutAppendReply {
 
 message GetRequest {
     string key = 1;
-    // You'll have to add definitions here.
+    string name = 2;
+    uint64 seq = 3;
 }
 
 message GetReply {

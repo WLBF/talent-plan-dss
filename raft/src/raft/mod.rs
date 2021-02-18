@@ -23,6 +23,7 @@ pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
+    pub command_term: u64,
 }
 
 /// State of a raft peer.
@@ -776,6 +777,7 @@ async fn apply_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, mut apply_rx:
                 command_valid: true,
                 command: log.command,
                 command_index: log.index,
+                command_term: log.term,
             };
 
             apply_ch.send(msg).await.unwrap();
