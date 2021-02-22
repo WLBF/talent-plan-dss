@@ -780,7 +780,7 @@ async fn apply_loop(stop: Arc<AtomicBool>, raft: Arc<Mutex<Raft>>, mut apply_rx:
                 command_term: log.term,
             };
 
-            apply_ch.send(msg).await.unwrap();
+            let _ = apply_ch.send(msg).await;
         }
     }
 }

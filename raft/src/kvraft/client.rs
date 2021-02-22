@@ -3,6 +3,7 @@ use std::fmt;
 use crate::proto::kvraftpb::*;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
+use std::time::Duration;
 
 enum Op {
     Put(String, String),
@@ -57,13 +58,27 @@ impl Clerk {
                 let _ = tx.send(res);
             });
 
-            if let Ok(Ok(reply)) = rx.recv() {
-                if reply.wrong_leader {
-                    i = (i + 1) % self.servers.len();
-                } else if reply.err.is_empty() {
-                    self.leader.store(i, Ordering::Relaxed);
-                    return reply.value;
+            let res = rx.recv_timeout(Duration::from_millis(600));
+            info!("[{}] seq: {}, res: {:?}", self.name, args.seq, res);
+            let (opt, redirect) = match res {
+                Ok(Ok(reply)) => {
+                    if !reply.wrong_leader && reply.err.is_empty() {
+                        self.leader.store(i, Ordering::Relaxed);
+                        (Some(reply.value), false)
+                    } else {
+                        (None, reply.wrong_leader)
+                    }
                 }
+                Ok(Err(_)) => (None, true),
+                Err(_) => (None, false),
+            };
+
+            if let Some(value) = opt {
+                return value;
+            }
+
+            if redirect {
+                i = (i + 1) % self.servers.len();
             }
         }
     }
@@ -97,13 +112,28 @@ impl Clerk {
                 let _ = tx.send(res);
             });
 
-            if let Ok(Ok(reply)) = rx.recv() {
-                if reply.wrong_leader {
-                    i = (i + 1) % self.servers.len();
-                } else if reply.err.is_empty() {
-                    self.leader.store(i, Ordering::Relaxed);
-                    return;
+            let res = rx.recv_timeout(Duration::from_millis(600));
+            info!("[{}] seq: {}, res: {:?}", self.name, args.seq, res);
+            let (opt, redirect) = match res {
+                Ok(Ok(reply)) => {
+                    if !reply.wrong_leader && reply.err.is_empty() {
+                        self.leader.store(i, Ordering::Relaxed);
+                        info!("[{}] return {}", self.name, args.seq);
+                        (Some(()), false)
+                    } else {
+                        (None, reply.wrong_leader)
+                    }
                 }
+                Ok(Err(_)) => (None, true),
+                Err(_) => (None, false),
+            };
+
+            if opt.is_some() {
+                return;
+            }
+
+            if redirect {
+                i = (i + 1) % self.servers.len();
             }
         }
     }
