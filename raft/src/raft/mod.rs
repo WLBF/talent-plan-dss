@@ -490,8 +490,8 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        let (heartbeat_tx, heartbeat_rx) = channel(1);
-        let (apply_tx, apply_rx) = channel(1);
+        let (heartbeat_tx, heartbeat_rx) = channel(3);
+        let (apply_tx, apply_rx) = channel(3);
         let raft = Arc::new(Mutex::new(raft));
 
         let raft_1 = raft.clone();
@@ -651,7 +651,7 @@ async fn try_election(raft: Arc<Mutex<Raft>>, heartbeat_tx: Sender<i32>) {
             let mut rf = raft.lock().unwrap();
             if args_term == rf.current_term && rf.role == Role::Candidate {
                 rf.convert_to_leader();
-                tokio::spawn(async move { heartbeat_tx.send(1).await });
+                let _ = heartbeat_tx.try_send(1);
             }
             return;
         }
@@ -726,7 +726,7 @@ async fn heartbeat(raft: Arc<Mutex<Raft>>, apply_tx: Sender<i32>) {
                             if rf.check_committed(rf.match_index[i]) {
                                 rf.commit_index = rf.match_index[i];
                                 info!("[{}] commit {}", rf.me, rf.commit_index);
-                                tokio::spawn(async move { tx_1.send(1).await });
+                                let _ = tx_1.try_send(1);
                             }
                         }
                     } else {
@@ -810,7 +810,7 @@ impl RaftService for Node {
                 let mut rf = raft.lock().unwrap();
                 let reply = rf.append_entries(args);
                 if rf.check_apply() {
-                    tokio::spawn(async move { tx.send(1).await });
+                    let _ = tx.try_send(1);
                 }
                 reply
             })
